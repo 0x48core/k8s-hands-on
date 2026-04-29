@@ -1,0 +1,17 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k8s-storage
+
+nodes:
+  - role: control-plane
+
+  - role: worker
+    # Extra mount so hostPath / local PVs on this node map to a real host directory
+    extraMounts:
+      - hostPath: /tmp/k8s-hands-on/storage
+        containerPath: /mnt/storage
+
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/k8s-hands-on/storage
+        containerPath: /mnt/storage

@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emptydir-demo
+  labels:
+    app: emptydir-demo
+spec:
+  initContainers:
+    - name: data-generator
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          echo "Hello from init container at $(date)" > /shared/message.txt
+          echo "Init done."
+      volumeMounts:
+        - name: shared-data
+          mountPath: /shared
+
+  containers:
+    - name: writer
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          while true; do
+            echo "Writer: $(date)" >> /shared/log.txt
+            sleep 5
+          done
+      volumeMounts:
+        - name: shared-data
+          mountPath: /shared
+
+    - name: reader
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          # Wait for log file to appear then tail it
+          until [ -f /shared/log.txt ]; do sleep 1; done
+          tail -f /shared/log.txt
+      volumeMounts:
+        - name: shared-data
+          mountPath: /shared
+
+  volumes:
+    - name: shared-data
+      emptyDir: {}
