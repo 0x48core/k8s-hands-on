@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  selector:
+    matchLabels:
+      app: app
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # Never reduce capacity
+      maxSurge: 1         # Spin up 1 new pod before killing the old one
+
+  template:
+    spec:
+      # 30s to drain connections before being killed
+      terminationGracePeriodSeconds: 35
+
+      containers:
+        - name: app
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            # Pod only receives traffic when /health/ready = 200
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          lifecycle:
+            preStop:
+              exec:
+                # Sleep 5s for LB to remove pod from endpoints
+                # before the app starts shutting down
+                command: ["/bin/sh", "-c", "sleep 5"]
