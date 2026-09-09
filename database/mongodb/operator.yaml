@@ -1,0 +1,92 @@
+# =============================================================================
+# OPTION 2 (recommended for production): MongoDB Community Operator
+# The operator handles replica set initiation, rolling version upgrades,
+# user management and TLS for you.
+#
+# Install the operator first:
+#   helm repo add mongodb https://mongodb.github.io/helm-charts
+#   helm install community-operator mongodb/community-operator \
+#       -n mongodb --create-namespace
+# =============================================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-user-password
+  namespace: mongodb
+type: Opaque
+stringData:
+  password: "<strong-password>"
+
+---
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: mongodb-rs
+  namespace: mongodb
+spec:
+  members: 3
+  type: ReplicaSet
+  version: "7.0.12"
+
+  security:
+    authentication:
+      modes: ["SCRAM"]
+
+  # The operator creates these users and keeps their credentials in sync.
+  users:
+    - name: appuser
+      db: admin
+      passwordSecretRef:
+        name: app-user-password
+      roles:
+        - name: readWrite
+          db: myapp
+        - name: clusterMonitor
+          db: admin
+      scramCredentialsSecretName: appuser-scram
+
+  # mongod settings, expressed in dot notation rather than nested YAML.
+  additionalMongodConfig:
+    storage.wiredTiger.engineConfig.cacheSizeGB: 1.5
+    storage.wiredTiger.engineConfig.journalCompressor: snappy
+    # Block compression for collection data: snappy | zlib | zstd | none
+    storage.wiredTiger.collectionConfig.blockCompressor: zstd
+    # Prefix compression for indexes - keeps more keys resident in cache.
+    storage.wiredTiger.indexConfig.prefixCompression: true
+    operationProfiling.mode: slowOp
+    operationProfiling.slowOpThresholdMs: 200
+
+  # Anything below is merged into the StatefulSet the operator generates.
+  statefulSet:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: mongod
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "4Gi"
+                limits:
+                  cpu: "2"
+                  # Must stay consistent with cacheSizeGB above.
+                  memory: "4Gi"
+          affinity:
+            # Spread members across nodes. The label is set by the operator.
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: mongodb-rs-svc
+                  topologyKey: kubernetes.io/hostname
+      volumeClaimTemplates:
+        # Name must be data-volume - the operator mounts dbPath from it.
+        - metadata:
+            name: data-volume
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: standard
+            resources:
+              requests:
+                storage: 50Gi
