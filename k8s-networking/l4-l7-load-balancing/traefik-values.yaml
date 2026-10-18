@@ -1,0 +1,21 @@
+accessLog:
+  enabled: true
+# Entrypoint "web" listens on 8000 in the pod; the Traefik Service exposes it on 80.
+# Gateway listeners must use the entrypoint port (8000).
+ports:
+  web:
+    port: 8000
+    exposedPort: 80
+providers:
+  kubernetesGateway:
+    enabled: true
+    experimentalChannel: false
+  kubernetesIngress:
+    enabled: false
+# We create our own GatewayClass / Gateway in 03-gateway-l7.yaml
+gatewayClass:
+  enabled: false
+gateway:
+  enabled: false
+service:
+  type: LoadBalancer
