@@ -1,0 +1,27 @@
+adminUser: admin
+adminPassword: admin            # lab only — use a Secret (admin.existingSecret) in real clusters
+
+service:
+  type: ClusterIP
+  port: 80
+
+persistence:
+  enabled: false
+
+# Provision data sources at startup — no clicking in the UI
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki.monitoring.svc.cluster.local:3100
+        isDefault: true
+      # From ../setup-prometheus (remove if you haven't deployed it)
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://prometheus-service.monitoring.svc.cluster.local:8080
