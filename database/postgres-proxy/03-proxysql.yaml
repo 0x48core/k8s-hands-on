@@ -1,0 +1,146 @@
+# =============================================================================
+# ProxySQL 3.x - L7 PostgreSQL proxy (transparent read/write split + cache)
+#
+# Parses every query, computes a digest, and routes by pgsql_query_rules:
+#
+#   SELECT ... FOR UPDATE  --> hostgroup 10 (pg-primary)
+#   SELECT ...             --> hostgroup 20 (pg-replica), cached 5s if tagged
+#   everything else        --> hostgroup 10 (default_hostgroup of the user)
+#
+# Ports:  6133 = PostgreSQL clients   6132 = PostgreSQL admin (SQLite-backed)
+#
+# proxysql.cnf is only read on FIRST boot (no proxysql.db yet). Data dir is an
+# emptyDir here, so every pod restart re-reads this ConfigMap. Runtime changes
+# made via the admin port are lost on restart unless you also update this file.
+# =============================================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: proxysql-config
+  namespace: pg-proxy
+type: Opaque
+stringData:
+  proxysql.cnf: |
+    datadir="/var/lib/proxysql"
+
+    admin_variables=
+    {
+      # radmin is the only user allowed to connect remotely
+      admin_credentials="admin:admin;radmin:radmin-pass"
+      pgsql_ifaces="0.0.0.0:6132"
+      mysql_ifaces="127.0.0.1:6032"
+    }
+
+    pgsql_variables=
+    {
+      threads=4
+      max_connections=5000
+      interfaces="0.0.0.0:6133"
+      default_query_timeout=36000000
+      server_version="17.11"
+      monitor_username="monitor"
+      monitor_password="monitor-pass"
+      monitor_connect_interval=10000
+      monitor_ping_interval=5000
+      monitor_read_only_interval=1500
+    }
+
+    # hostgroup 10 = writer, 20 = reader
+    pgsql_servers=
+    (
+      { address="pg-primary.pg-proxy.svc.cluster.local", port=5432, hostgroup=10, max_connections=15 },
+      { address="pg-replica.pg-proxy.svc.cluster.local", port=5432, hostgroup=20, max_connections=15 }
+    )
+
+    pgsql_users=
+    (
+      { username="app", password="app-pass", default_hostgroup=10, active=1 }
+    )
+
+    pgsql_query_rules=
+    (
+      {
+        rule_id=1
+        active=1
+        match_digest="^SELECT .* FOR UPDATE"
+        destination_hostgroup=10
+        apply=1
+      },
+      {
+        # Demo of proxy-level caching: only queries that carry this marker.
+        # match_pattern (raw text), not match_digest - digests strip comments.
+        rule_id=5
+        active=1
+        match_pattern="/\\* cache \\*/"
+        destination_hostgroup=20
+        cache_ttl=5000
+        apply=1
+      },
+      {
+        rule_id=10
+        active=1
+        match_digest="^SELECT"
+        destination_hostgroup=20
+        apply=1
+      }
+    )
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxysql
+  namespace: pg-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: proxysql
+  template:
+    metadata:
+      labels:
+        app: proxysql
+    spec:
+      containers:
+        - name: proxysql
+          image: proxysql/proxysql:3.0.11
+          ports:
+            - name: pgsql
+              containerPort: 6133
+            - name: admin
+              containerPort: 6132
+          readinessProbe:
+            tcpSocket:
+              port: 6133
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/proxysql.cnf
+              subPath: proxysql.cnf
+            - name: data
+              mountPath: /var/lib/proxysql
+      volumes:
+        - name: config
+          secret:
+            secretName: proxysql-config
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxysql
+  namespace: pg-proxy
+spec:
+  selector:
+    app: proxysql
+  ports:
+    - name: pgsql
+      port: 6133
+    - name: admin
+      port: 6132
