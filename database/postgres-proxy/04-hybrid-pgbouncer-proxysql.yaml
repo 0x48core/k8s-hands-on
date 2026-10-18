@@ -1,0 +1,98 @@
+# =============================================================================
+# Hybrid pattern: PgBouncer (edge, L4) --> ProxySQL (middle, L7) --> Postgres
+#
+#   apps (thousands of short-lived conns)
+#        |
+#   pgbouncer-edge :6432   absorbs the storm, compresses to <=20 conns
+#        |
+#   proxysql :6133          parses SQL, SELECT -> replica, writes -> primary
+#        |
+#   pg-primary / pg-replica
+#
+# Reuses the pgbouncer-userlist Secret from 02-pgbouncer.yaml.
+# In real life this edge pooler is often a sidecar next to each app pod.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-edge-config
+  namespace: pg-proxy
+data:
+  pgbouncer.ini: |
+    [databases]
+    ; single entry point - ProxySQL decides primary vs replica per query
+    appdb = host=proxysql.pg-proxy.svc.cluster.local port=6133 dbname=appdb
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = 6432
+    auth_type = scram-sha-256
+    auth_file = /etc/pgbouncer/userlist.txt
+    admin_users = app
+    stats_users = app
+
+    pool_mode = transaction
+    max_client_conn = 5000
+    default_pool_size = 20
+    max_prepared_statements = 200
+    ignore_startup_parameters = extra_float_digits,options
+
+    log_connections = 0
+    log_disconnections = 0
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer-edge
+  namespace: pg-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgbouncer-edge
+  template:
+    metadata:
+      labels:
+        app: pgbouncer-edge
+    spec:
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer:v1.26.0-p0
+          ports:
+            - containerPort: 6432
+          readinessProbe:
+            tcpSocket:
+              port: 6432
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: "1", memory: 128Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pgbouncer/pgbouncer.ini
+              subPath: pgbouncer.ini
+            - name: userlist
+              mountPath: /etc/pgbouncer/userlist.txt
+              subPath: userlist.txt
+      volumes:
+        - name: config
+          configMap:
+            name: pgbouncer-edge-config
+        - name: userlist
+          secret:
+            secretName: pgbouncer-userlist
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer-edge
+  namespace: pg-proxy
+spec:
+  selector:
+    app: pgbouncer-edge
+  ports:
+    - name: pgbouncer
+      port: 6432

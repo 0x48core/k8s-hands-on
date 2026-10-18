@@ -1,0 +1,121 @@
+# =============================================================================
+# PgBouncer - L4 connection pooler (transaction pooling)
+#
+# Does NOT parse SQL. It just multiplexes many client connections onto a small
+# pool of server connections:
+#
+#   up to 5000 clients  -->  pgbouncer  -->  max 12 server conns  -->  pg-primary
+#
+# Single-threaded (libevent). Scale out with replicas, not CPU.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-config
+  namespace: pg-proxy
+data:
+  pgbouncer.ini: |
+    [databases]
+    ; client asks for "appdb"     -> primary (read/write)
+    ; client asks for "appdb_ro"  -> replica (read-only). PgBouncer cannot split
+    ; R/W itself, so the APPLICATION must pick the right database name.
+    appdb    = host=pg-primary.pg-proxy.svc.cluster.local port=5432 dbname=appdb
+    appdb_ro = host=pg-replica.pg-proxy.svc.cluster.local port=5432 dbname=appdb
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = 6432
+    auth_type = scram-sha-256
+    auth_file = /etc/pgbouncer/userlist.txt
+    admin_users = app
+    stats_users = app
+
+    ; transaction | session | statement
+    pool_mode = transaction
+    ; client side: cheap (~2KB each)
+    max_client_conn = 5000
+    ; server side, per (database,user) pair. Budget is PER POD:
+    ;   2 pods x max_db_connections 12 = 24  +  ProxySQL 15  = 39  < 50
+    default_pool_size = 10
+    reserve_pool_size = 2
+    reserve_pool_timeout = 3
+    max_db_connections = 12
+
+    server_idle_timeout = 60
+    ; required in transaction mode with protocol-level prepared statements
+    max_prepared_statements = 200
+    ignore_startup_parameters = extra_float_digits,options
+
+    log_connections = 0
+    log_disconnections = 0
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pgbouncer-userlist
+  namespace: pg-proxy
+type: Opaque
+stringData:
+  # Plain-text password lets PgBouncer do SCRAM to the backend too.
+  # In production use auth_query or SCRAM verifiers instead.
+  userlist.txt: |
+    "app" "app-pass"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: pg-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer:v1.26.0-p0
+          ports:
+            - containerPort: 6432
+          readinessProbe:
+            tcpSocket:
+              port: 6432
+            periodSeconds: 5
+          resources:
+            # 1 core is the ceiling: pgbouncer is single-threaded
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: "1", memory: 128Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pgbouncer/pgbouncer.ini
+              subPath: pgbouncer.ini
+            - name: userlist
+              mountPath: /etc/pgbouncer/userlist.txt
+              subPath: userlist.txt
+      volumes:
+        - name: config
+          configMap:
+            name: pgbouncer-config
+        - name: userlist
+          secret:
+            secretName: pgbouncer-userlist
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  namespace: pg-proxy
+spec:
+  selector:
+    app: pgbouncer
+  ports:
+    - name: pgbouncer
+      port: 6432

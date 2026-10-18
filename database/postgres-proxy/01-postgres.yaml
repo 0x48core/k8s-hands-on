@@ -1,0 +1,237 @@
+# =============================================================================
+# PostgreSQL 17: 1 primary + 1 streaming replica (plain StatefulSets)
+#
+# This is the backend that PgBouncer (L4) and ProxySQL (L7) sit in front of.
+# max_connections is deliberately LOW (50) so connection exhaustion is easy to
+# reproduce with pgbench - that is the whole point of the lab.
+#
+#   pg-primary-0  <-- writes          (Service: pg-primary)
+#   pg-replica-0  <-- reads, hot_standby, cloned with pg_basebackup -R
+#                                     (Service: pg-replica)
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pg-proxy
+
+---
+# Lab credentials. Do NOT reuse in real environments.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg-credentials
+  namespace: pg-proxy
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: postgres-pass
+  APP_USER: app
+  APP_PASSWORD: app-pass
+  REPLICATION_USER: replicator
+  REPLICATION_PASSWORD: repl-pass
+  MONITOR_USER: monitor
+  MONITOR_PASSWORD: monitor-pass
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-config
+  namespace: pg-proxy
+data:
+  postgresql.conf: |
+    listen_addresses = '*'
+    # Intentionally small: 50 backend processes max. Without a pooler, a burst
+    # of 200 clients fails with "sorry, too many clients already".
+    max_connections = 50
+    shared_buffers = 128MB
+    wal_level = replica
+    max_wal_senders = 5
+    max_replication_slots = 5
+    hot_standby = on
+    log_connections = off
+
+  # Runs once, only on first boot of the primary (empty data dir).
+  init-primary.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-SQL
+      CREATE ROLE ${REPLICATION_USER} WITH REPLICATION LOGIN PASSWORD '${REPLICATION_PASSWORD}';
+      CREATE ROLE ${APP_USER} WITH LOGIN PASSWORD '${APP_PASSWORD}';
+      CREATE ROLE ${MONITOR_USER} WITH LOGIN PASSWORD '${MONITOR_PASSWORD}';
+      GRANT pg_monitor TO ${MONITOR_USER};
+      CREATE DATABASE appdb OWNER ${APP_USER};
+    SQL
+    # The image's default pg_hba.conf does not allow replication connections.
+    echo "host replication ${REPLICATION_USER} all scram-sha-256" >> "$PGDATA/pg_hba.conf"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-primary
+  namespace: pg-proxy
+spec:
+  selector:
+    app: postgres
+    role: primary
+  ports:
+    - name: postgres
+      port: 5432
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-replica
+  namespace: pg-proxy
+spec:
+  selector:
+    app: postgres
+    role: replica
+  ports:
+    - name: postgres
+      port: 5432
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-primary
+  namespace: pg-proxy
+spec:
+  serviceName: pg-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+      role: primary
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: primary
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.11
+          args: ["-c", "config_file=/etc/postgresql/postgresql.conf"]
+          envFrom:
+            - secretRef:
+                name: pg-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+            - name: config
+              mountPath: /docker-entrypoint-initdb.d/init-primary.sh
+              subPath: init-primary.sh
+      volumes:
+        - name: config
+          configMap:
+            name: pg-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-replica
+  namespace: pg-proxy
+spec:
+  serviceName: pg-replica
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+      role: replica
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: replica
+    spec:
+      securityContext:
+        fsGroup: 999
+      initContainers:
+        # Clone the primary on first boot. -R writes standby.signal and
+        # primary_conninfo, so postgres starts as a hot standby.
+        - name: clone-primary
+          image: postgres:17.11
+          securityContext:
+            runAsUser: 999
+          envFrom:
+            - secretRef:
+                name: pg-credentials
+          command:
+            - bash
+            - -ec
+            - |
+              if [ -s /var/lib/postgresql/data/pgdata/PG_VERSION ]; then
+                echo "data dir already initialised, skipping clone"; exit 0
+              fi
+              until pg_isready -h pg-primary -U postgres; do sleep 2; done
+              PGPASSWORD="$REPLICATION_PASSWORD" pg_basebackup \
+                -h pg-primary -U "$REPLICATION_USER" \
+                -D /var/lib/postgresql/data/pgdata -R -X stream -P
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:17.11
+          args: ["-c", "config_file=/etc/postgresql/postgresql.conf"]
+          envFrom:
+            - secretRef:
+                name: pg-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+      volumes:
+        - name: config
+          configMap:
+            name: pg-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
