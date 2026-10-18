@@ -1,0 +1,44 @@
+# Layer 4: kube-proxy (iptables/IPVS) picks a backend pod once per TCP connection.
+# Every request sent over that connection lands on the same pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-l4
+  namespace: lb-lab
+  # On a cloud, annotations select the L4 load balancer, e.g. AWS NLB:
+  # annotations:
+  #   service.beta.kubernetes.io/aws-load-balancer-type: "external"
+  #   service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+spec:
+  type: LoadBalancer        # kind: needs cloud-provider-kind (or MetalLB) to get an external IP
+  selector:
+    app: web
+    version: v1
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  # Cluster (default): any node accepts traffic and may forward to another node (SNAT, client IP lost).
+  # Local: only nodes running a pod accept traffic; client IP preserved, no extra hop.
+  externalTrafficPolicy: Cluster
+---
+# Same backends, but each client IP is pinned to one pod (L4 stickiness, no cookies needed)
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-l4-sticky
+  namespace: lb-lab
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+    version: v1
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 600

@@ -1,0 +1,65 @@
+# Layer 7: Traefik terminates HTTP and picks a backend pod for every request,
+# using host / path / header / weight rules from the HTTPRoute.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: traefik-lb-lab
+spec:
+  controllerName: traefik.io/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: web-gw
+  namespace: lb-lab
+spec:
+  gatewayClassName: traefik-lb-lab
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 8000            # Traefik "web" entrypoint (exposed as :80 by the traefik Service)
+      hostname: lb.local
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web-route
+  namespace: lb-lab
+spec:
+  parentRefs:
+    - name: web-gw
+  hostnames: ["lb.local"]
+  rules:
+    # Header routing: x-version: v2 always goes to the canary
+    - matches:
+        - headers:
+            - name: x-version
+              value: v2
+      backendRefs:
+        - name: web-v2
+          port: 80
+
+    # Weighted split: /split sends ~80% to v1 and ~20% to v2
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /split
+      backendRefs:
+        - name: web
+          port: 80
+          weight: 80
+        - name: web-v2
+          port: 80
+          weight: 20
+
+    # Default: everything else to v1, round-robin per request across its 3 pods
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web
+          port: 80
