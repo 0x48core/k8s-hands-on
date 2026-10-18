@@ -1,0 +1,52 @@
+# Loki in single-binary mode with filesystem storage — good for a lab / kind cluster.
+# For production use SimpleScalable/Distributed mode with object storage (S3, GCS, MinIO).
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false            # single tenant, no X-Scope-OrgID header needed
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  limits_config:
+    retention_period: 168h       # keep logs 7 days
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+
+# Disable the scalable components
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+# Keep the lab small
+gateway:
+  enabled: false
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+minio:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
